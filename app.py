@@ -63,7 +63,7 @@ st.markdown("""
 def load_catalog():
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
-        df = conn.read(worksheet="Produtos", ttl=0)
+        df = conn.read(worksheet="Produtos", ttl=600)  # Cache de 10 min para evitar ficar batendo na API toda hora
         if df.empty or 'produto' not in df.columns:
              return pd.DataFrame([
                 {"produto": "Paleta Morango", "custo": 3.40, "venda": 12.00},
@@ -138,8 +138,9 @@ def load_data():
             st.warning("⚠️ Configuração pendente: Adicione as credenciais do Google Sheets em `.streamlit/secrets.toml`.")
             return pd.DataFrame(columns=['data', 'produto', 'tipo_movimento', 'quantidade', 'valor_unitario', 'total_monetario'])
 
-        # Lê a aba 'Transacoes'. TTL reduzido para refletir atualizações
-        df = conn.read(worksheet="Transacoes", ttl=0)
+        # Lê a aba 'Transacoes'. TTL aumentado para evitar erro 429 (Quota Exceeded)
+        # O cache é limpo manualmente quando salvamos algo
+        df = conn.read(worksheet="Transacoes", ttl=600)
         
         # Converter coluna de data para datetime se existir, senão cria DF vazio
         if not df.empty and 'data' in df.columns:
