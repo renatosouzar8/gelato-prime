@@ -87,6 +87,45 @@ def save_catalog(df):
         return False
 
 
+# Função auxiliar para calcular inventário
+def calculate_inventory(df_transacoes, products_list):
+    inventory = {p: 0 for p in products_list}
+    if df_transacoes.empty:
+        return inventory
+        
+    for idx, row in df_transacoes.iterrows():
+        prod = row['produto']
+        tipo = row['tipo_movimento']
+        q = row['quantidade']
+        
+        # Se produto não existe mais no catálogo, ainda conta se tiver histórico
+        if prod not in inventory:
+            inventory[prod] = 0
+            
+        if tipo == "Compra Estoque":
+            inventory[prod] += q
+        else:
+            # Qualquer saída (Venda, Família, Quebra)
+            inventory[prod] -= q
+    return inventory
+
+# Salvar ajuste de estoque
+def save_adjustment(produto, delta_qtd, custo_unitario):
+    tipo = "Compra Estoque" if delta_qtd > 0 else "Quebra/Perda"
+    qtd_abs = abs(delta_qtd)
+    total_monetario = 0 
+    
+    new_row = {
+        "data": datetime.now().isoformat(),
+        "produto": produto,
+        "tipo_movimento": tipo,
+        "quantidade": qtd_abs,
+        "valor_unitario": custo_unitario,
+        "total_monetario": total_monetario
+    }
+    return save_transaction(new_row)
+
+
 # Função para carregar dados (com cache para performance)
 def load_data():
     conn = st.connection("gsheets", type=GSheetsConnection)
@@ -101,7 +140,7 @@ def load_data():
         
         # Converter coluna de data para datetime se existir, senão cria DF vazio
         if not df.empty and 'data' in df.columns:
-             df['data'] = pd.to_datetime(df['data'])
+             df['data'] = pd.to_datetime(df['data'], format='mixed')
         else:
             # Estrutura base caso a planilha esteja vazia
             df = pd.DataFrame(columns=['data', 'produto', 'tipo_movimento', 'quantidade', 'valor_unitario', 'total_monetario'])
@@ -258,13 +297,18 @@ with tab_gestao:
         receita = faturamento
         cmv = 0
         for idx, row in vendas_periodo.iterrows():
-            # Buscar custo atual do catálogo (simplificação) - Ideal seria histórico
+            # Buscar custo atual do catálogo (simplificação) - Ideal seria histórico ou salvo na transação
+            # fallback para valor_unitario caso seja Venda (mas venda tem preço de venda)
+            # Tentar pegar do catalogo atual
             p_nome = row['produto']
+            q = row['quantidade']
             try:
+                # Se tiver no catalogo
                 c_item = float(df_catalog[df_catalog['produto'] == p_nome].iloc[0]['custo'])
             except:
+                # Se não, tenta estimar algo ou 0
                 c_item = 0
-            cmv += (row['quantidade'] * c_item)
+            cmv += (q * c_item)
             
         lucro = receita - cmv
         
@@ -276,24 +320,11 @@ with tab_gestao:
         
         st.markdown("---")
         
-        # Estoque Atual (Sempre Geral, independente do filtro de data)
+        # Estoque Atual
         st.markdown("##### 📦 Estoque Atual")
         
-        inventory = {p: 0 for p in products_list}
-            
-        for idx, row in df.iterrows():
-            prod = row['produto']
-            tipo = row['tipo_movimento']
-            q = row['quantidade']
-            
-            # Se produto não existe mais no catálogo, ainda conta se tiver histórico
-            if prod not in inventory:
-                inventory[prod] = 0
-                
-            if tipo == "Compra Estoque":
-                inventory[prod] += q
-            else:
-                inventory[prod] -= q
+        inventory = calculate_inventory(df, products_list)
+        
         
         inv_data = []
         for p, saldo in inventory.items():
@@ -340,20 +371,68 @@ with tab_config:
                 st.error("Produto já existe!")
     
     st.markdown("---")
+    st.markdown("---")
     st.markdown("##### Lista de Produtos")
     
     if not df_catalog.empty:
-        # Edição simplificada: Excluir e Criar de novo por enquanto
-        # Exibir como tabela editável seria ideal, mas st.data_editor com gsheets precisa de cuidado
-        # Vamos usar lista com botão de remover
+        # Calcular estoque atual para exibir no editor
+        current_inventory = calculate_inventory(load_data(), products_list)
+        
+        # Usar expanders para edição
         for index, row in df_catalog.iterrows():
-            c1, c2, c3, c4 = st.columns([3, 1.5, 1.5, 1])
-            c1.text(row['produto'])
-            c2.text(f"C: {row['custo']}")
-            c3.text(f"V: {row['venda']}")
-            if c4.button("🗑️", key=f"del_{index}"):
-                df_updated = df_catalog.drop(index)
-                save_catalog(df_updated)
-                st.rerun()
+            p_nome = row['produto']
+            
+            # Expander com Título = Nome do Produto + Estoque
+            estoque_atual = current_inventory.get(p_nome, 0)
+            with st.expander(f"{p_nome} (Estoque: {estoque_atual})"):
+                
+                # Form de Edição
+                with st.form(key=f"edit_{index}"):
+                    c1, c2 = st.columns(2)
+                    edit_nome = c1.text_input("Nome", p_nome)
+                    
+                    c_price, c_sell = st.columns(2)
+                    edit_custo = c_price.number_input("Custo", value=float(row['custo']), step=0.10)
+                    edit_venda = c_sell.number_input("Venda", value=float(row['venda']), step=0.50)
+                    
+                    st.divider()
+                    st.markdown("**Ajuste de Estoque**")
+                    c_stock_1, c_stock_2 = st.columns([1, 2])
+                    new_stock_val = c_stock_2.number_input("Estoque Real", value=int(estoque_atual), step=1, key=f"stock_{index}")
+                    c_stock_1.info(f"Atual: {estoque_atual}")
+                    
+                    st.divider()
+                    
+                    cols_btn = st.columns([1, 1])
+                    update_btn = cols_btn[0].form_submit_button("💾 Salvar Alterações")
+                    
+                    # Para deletar, precisamos de um botão fora do form ou lógica com checkbox dentro do form (submit único)
+                    # Streamlit forms não suportam multiplos botões de submit com lógicas diferentes facilmente
+                    delete_check = cols_btn[1].checkbox("🗑️ Excluir Produto")
+
+                    if update_btn:
+                        if delete_check:
+                            # Lógica de Exclusão Robusta
+                            # O drop pelo index pode falhar se o DF mudou. Vamos filtrar
+                            df_updated = df_catalog[df_catalog['produto'] != p_nome]
+                            save_catalog(df_updated)
+                            st.success(f"Produto {p_nome} excluído!")
+                            st.rerun()
+                        else:
+                            # Lógica de Atualização
+                            # 1. Atualizar Catálogo
+                            df_catalog.at[index, 'produto'] = edit_nome
+                            df_catalog.at[index, 'custo'] = edit_custo
+                            df_catalog.at[index, 'venda'] = edit_venda
+                            save_catalog(df_catalog)
+                            
+                            # 2. Ajuste de Estoque (Se mudou)
+                            if new_stock_val != estoque_atual:
+                                delta = new_stock_val - estoque_atual
+                                save_adjustment(edit_nome, delta, edit_custo)
+                                st.toast(f"Estoque ajustado: {delta:+d}", icon="📦")
+                            
+                            st.success("Produto atualizado!")
+                            st.rerun()
 
 st.success("Sistema Carregado (Modo de Demonstração)")
