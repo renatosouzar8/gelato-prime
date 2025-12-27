@@ -58,37 +58,68 @@ st.markdown("""
 
 # --- DADOS E CONEXÃO ---
 
-# Funções de Dados
+# GERENCIAMENTO DE ESTADO (SESSION STATE)
+if 'df_transacoes' not in st.session_state:
+    st.session_state.df_transacoes = pd.DataFrame()
+if 'df_catalog' not in st.session_state:
+    st.session_state.df_catalog = pd.DataFrame()
 
-def load_catalog():
+def refresh_data():
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
-        df = conn.read(worksheet="Produtos", ttl=600)  # Cache de 10 min para evitar ficar batendo na API toda hora
-        if df.empty or 'produto' not in df.columns:
-             return pd.DataFrame([
-                {"produto": "Paleta Morango", "custo": 3.40, "venda": 12.00},
-                {"produto": "Picolé Morango", "custo": 1.20, "venda": 4.50},
-             ])
-        return df
+        # Puxamos com ttl=0 para garantir dados frescos quando o usuário pede
+        st.session_state.df_catalog = conn.read(worksheet="Produtos", ttl=0)
+        st.session_state.df_transacoes = conn.read(worksheet="Transacoes", ttl=0)
+        
+        # Converter datas
+        if not st.session_state.df_transacoes.empty and 'data' in st.session_state.df_transacoes.columns:
+             st.session_state.df_transacoes['data'] = pd.to_datetime(st.session_state.df_transacoes['data'], format='mixed')
+             
+        st.toast("Dados atualizados do Google Sheets!", icon="🔄")
     except Exception as e:
-        # Retorna DF vazio com flag indicando erro para a UI tratar
-        err_df = pd.DataFrame([
-            {"produto": "Paleta Morango", "custo": 3.40, "venda": 12.00},
-            {"produto": "Picolé Morango", "custo": 1.20, "venda": 4.50},
-        ])
-        err_df.attrs['error'] = str(e)
-        return err_df
+        # Fallback silencioso ou toast de erro, mas mantém o estado anterior se possível
+        st.error(f"Erro ao buscar dados: {e}")
 
-def save_catalog(df):
+# Função para inicializar dados na primeira carga
+def ensure_data_loaded():
+    if st.session_state.df_catalog.empty and st.session_state.df_transacoes.empty:
+        refresh_data()
+        
+        # Se após refresh o catálogo estiver vazio, criar estrutura básica na memória para não quebrar UI
+        if st.session_state.df_catalog.empty:
+             st.session_state.df_catalog = pd.DataFrame(columns=['produto', 'custo', 'venda'])
+
+# Funções de Salvamento com Atualização Local (Otimista)
+def save_catalog_state(df_new):
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
-        conn.update(worksheet="Produtos", data=df)
+        # 1. Update Remote
+        conn.update(worksheet="Produtos", data=df_new)
+        # 2. Update Local State (Imediato)
+        st.session_state.df_catalog = df_new
+        st.cache_data.clear() # Limpar cache global só por garantia
+        return True
+    except Exception as e:
+        st.error(f"Erro ao salvar catálogo remoto: {e}")
+        return False
+
+def save_transaction_state(new_row_dict):
+    conn = st.connection("gsheets", type=GSheetsConnection)
+    try:
+        # 1. Update Local State (Instantâneo)
+        new_df = pd.DataFrame([new_row_dict])
+        if st.session_state.df_transacoes.empty:
+             st.session_state.df_transacoes = new_df
+        else:
+             st.session_state.df_transacoes = pd.concat([st.session_state.df_transacoes, new_df], ignore_index=True)
+            
+        # 2. Update Remote
+        conn.update(worksheet="Transacoes", data=st.session_state.df_transacoes)
         st.cache_data.clear()
         return True
     except Exception as e:
-        st.error(f"Erro ao atualizar catálogo: {e}")
+        st.error(f"Erro ao salvar transação remota: {e}")
         return False
-
 
 # Função auxiliar para calcular inventário
 def calculate_inventory(df_transacoes, products_list):
@@ -108,11 +139,10 @@ def calculate_inventory(df_transacoes, products_list):
         if tipo == "Compra Estoque":
             inventory[prod] += q
         else:
-            # Qualquer saída (Venda, Família, Quebra)
             inventory[prod] -= q
     return inventory
 
-# Salvar ajuste de estoque
+# Salvar ajuste de estoque (usando o novo save state)
 def save_adjustment(produto, delta_qtd, custo_unitario):
     tipo = "Compra Estoque" if delta_qtd > 0 else "Quebra/Perda"
     qtd_abs = abs(delta_qtd)
@@ -126,48 +156,7 @@ def save_adjustment(produto, delta_qtd, custo_unitario):
         "valor_unitario": custo_unitario,
         "total_monetario": total_monetario
     }
-    return save_transaction(new_row)
-
-
-# Função para carregar dados (com cache para performance)
-def load_data():
-    conn = st.connection("gsheets", type=GSheetsConnection)
-    try:
-        # Verifica se secrets existem antes de tentar conectar
-        if "connections" not in st.secrets or "gsheets" not in st.secrets["connections"]:
-            st.warning("⚠️ Configuração pendente: Adicione as credenciais do Google Sheets em `.streamlit/secrets.toml`.")
-            return pd.DataFrame(columns=['data', 'produto', 'tipo_movimento', 'quantidade', 'valor_unitario', 'total_monetario'])
-
-        # Lê a aba 'Transacoes'. TTL aumentado para evitar erro 429 (Quota Exceeded)
-        # O cache é limpo manualmente quando salvamos algo
-        df = conn.read(worksheet="Transacoes", ttl=600)
-        
-        # Converter coluna de data para datetime se existir, senão cria DF vazio
-        if not df.empty and 'data' in df.columns:
-             df['data'] = pd.to_datetime(df['data'], format='mixed')
-        else:
-            # Estrutura base caso a planilha esteja vazia
-            df = pd.DataFrame(columns=['data', 'produto', 'tipo_movimento', 'quantidade', 'valor_unitario', 'total_monetario'])
-        return df
-    except Exception as e:
-        st.error(f"Erro ao conectar com Google Sheets: {e}")
-        return pd.DataFrame(columns=['data', 'produto', 'tipo_movimento', 'quantidade', 'valor_unitario', 'total_monetario'])
-
-# Função para salvar transação
-def save_transaction(new_row):
-    conn = st.connection("gsheets", type=GSheetsConnection)
-    try:
-        df = load_data()
-        if df.empty:
-            updated_df = pd.DataFrame([new_row])
-        else:
-            updated_df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-        conn.update(worksheet="Transacoes", data=updated_df)
-        st.cache_data.clear() # Limpa cache para recarregar dados novos
-        return True
-    except Exception as e:
-        st.error(f"Erro ao salvar: {e}")
-        return False
+    return save_transaction_state(new_row)
 
 # --- UI APP ---
 
@@ -181,9 +170,17 @@ with col_logo:
 with col_title:
     st.markdown("### Gelato Prime")
 
-# Carregar dados
-df_catalog = load_catalog()
+# Garantir dados carregados ao iniciar
+ensure_data_loaded()
+
+# Alias para facilitar uso no código UI (apontando para Session State)
+df_catalog = st.session_state.df_catalog
 products_list = df_catalog['produto'].tolist() if not df_catalog.empty else []
+
+# Botão de Refresh Manual
+if st.button("🔄 Atualizar Dados da Nuvem", help="Força baixar dados novos do Google Sheets"):
+    refresh_data()
+    st.rerun()
 
 # Tabs de Navegação
 tab_registrar, tab_gestao, tab_config = st.tabs(["📝 Registrar", "📊 Gestão", "⚙️ Config"])
@@ -222,7 +219,7 @@ with tab_registrar:
             if not produto:
                 st.error("Selecione um produto!")
             else:
-                # Buscar preços no DF do catálogo
+                # Buscar preços no DF do catálogo (Usando session state)
                 try:
                     item_data = df_catalog[df_catalog['produto'] == produto].iloc[0]
                     custo_item = float(item_data['custo'])
@@ -253,13 +250,13 @@ with tab_registrar:
                     "total_monetario": total_monetario
                 }
                 
-                if save_transaction(new_row):
+                if save_transaction_state(new_row):
                     st.toast(f"✅ {produto} ({qtd}x) registrado!", icon="🍦")
-                # Não faz rerun total para manter fluidez, toast é suficiente
+                # Não faz rerun para manter fluidez
 
 # --- ABA 2: GESTÃO ---
 with tab_gestao:
-    df = load_data()
+    df = st.session_state.df_transacoes
     
     if df.empty:
         st.info("Nenhuma transação registrada.")
@@ -269,7 +266,9 @@ with tab_gestao:
         periodo = st.selectbox("Período", ["Hoje", "Últimos 7 Dias", "Este Mês", "Personalizado"], label_visibility="collapsed")
         
         hoje = pd.Timestamp.now().normalize()
-        df['data_dt'] = pd.to_datetime(df['data'])
+        # Garantir que temos coluna de data convertida
+        if 'data_dt' not in df.columns:
+             df['data_dt'] = pd.to_datetime(df['data'], errors='coerce')
         
         if periodo == "Hoje":
             start_date = hoje
@@ -285,12 +284,12 @@ with tab_gestao:
             d1 = c1.date_input("Início", hoje)
             d2 = c2.date_input("Fim", hoje)
             start_date = pd.to_datetime(d1)
-            end_date = pd.to_datetime(d2) + pd.Timedelta(days=1) # Incluir o dia final
+            end_date = pd.to_datetime(d2) + pd.Timedelta(days=1)
             
         # Filtrar DF para KPIs
         df_filtered = df[(df['data_dt'] >= start_date) & (df['data_dt'] < end_date)]
         
-        # 1. Faturamento (Vendas no período)
+        # 1. Faturamento
         vendas_periodo = df_filtered[df_filtered['tipo_movimento'] == 'Venda']
         faturamento = vendas_periodo['total_monetario'].sum()
         
@@ -301,16 +300,11 @@ with tab_gestao:
         receita = faturamento
         cmv = 0
         for idx, row in vendas_periodo.iterrows():
-            # Buscar custo atual do catálogo (simplificação) - Ideal seria histórico ou salvo na transação
-            # fallback para valor_unitario caso seja Venda (mas venda tem preço de venda)
-            # Tentar pegar do catalogo atual
             p_nome = row['produto']
             q = row['quantidade']
             try:
-                # Se tiver no catalogo
                 c_item = float(df_catalog[df_catalog['produto'] == p_nome].iloc[0]['custo'])
             except:
-                # Se não, tenta estimar algo ou 0
                 c_item = 0
             cmv += (q * c_item)
             
@@ -324,15 +318,14 @@ with tab_gestao:
         
         st.markdown("---")
         
-        # Estoque Atual
+        # Estoque Atual (Calculado sobre TODO o histórico, não filtrado)
         st.markdown("##### 📦 Estoque Atual")
         
+        # IMPORTANTE: Calcular estoque em cima de df completo, não df_filtered
         inventory = calculate_inventory(df, products_list)
-        
         
         inv_data = []
         for p, saldo in inventory.items():
-            # Só mostra produtos ativos ou com saldo != 0
             if p in products_list or saldo != 0:
                 if saldo < 5:
                     status = "🚨"
@@ -355,21 +348,21 @@ with tab_config:
     st.markdown("##### ⚙️ Gerenciar Produtos")
     
     # Check de Erro no Catálogo
-    if hasattr(df_catalog, 'attrs') and 'error' in df_catalog.attrs:
-        st.error("A aba 'Produtos' não foi encontrada na sua planilha!")
-        st.info("O sistema pode tentar criar essa aba automaticamente para você.")
-        
-        if st.button("🛠️ CRIAR ABA 'Produtos' AGORA"):
-            initial_data = pd.DataFrame([
+    # Se estiver vazio mas não tiver erro, ok. Se tiver erro attrs, mostra botão.
+    # Como mudamos a lógica de load, o erro vem no Exception do refresh_data.
+    # Vamos checar se o df_catalog está vazio.
+    if df_catalog.empty:
+         st.warning("Catálogo vazio ou não carregado.")
+         st.info("Se você ainda não criou a aba 'Produtos', clique abaixo.")
+         if st.button("🛠️ CRIAR ABA 'Produtos' AGORA"):
+             initial_data = pd.DataFrame([
                 {"produto": "Paleta Morango", "custo": 3.40, "venda": 12.00},
-                {"produto": "Picolé Morango", "custo": 1.20, "venda": 4.50}
-            ])
-            if save_catalog(initial_data):
-                st.success("Aba 'Produtos' criada com sucesso! Recarregando...")
-                st.rerun()
-            else:
-                st.error("Falha ao criar automaticamente. Por favor, crie manualmente no Google Sheets.")
-    
+                {"produto": "Picolé Morango", "custo": 1.20, "venda": 4.50},
+             ])
+             if save_catalog_state(initial_data):
+                 st.success("Criado com sucesso! Atualizando...")
+                 st.rerun()
+
     # Form para Adicionar
     with st.expander("Novo Produto", expanded=True):
         new_prod_name = st.text_input("Nome do Produto")
@@ -385,29 +378,25 @@ with tab_config:
                 else:
                     df_updated = pd.concat([df_catalog, new_item], ignore_index=True)
                 
-                if save_catalog(df_updated):
+                if save_catalog_state(df_updated):
                     st.success("Produto adicionado!")
                     st.rerun()
             elif new_prod_name in products_list:
                 st.error("Produto já existe!")
     
     st.markdown("---")
-    st.markdown("---")
     st.markdown("##### Lista de Produtos")
     
     if not df_catalog.empty:
         # Calcular estoque atual para exibir no editor
-        current_inventory = calculate_inventory(load_data(), products_list)
+        # Usamos df transacoes completo do session state
+        current_inventory = calculate_inventory(st.session_state.df_transacoes, products_list)
         
-        # Usar expanders para edição
         for index, row in df_catalog.iterrows():
             p_nome = row['produto']
-            
-            # Expander com Título = Nome do Produto + Estoque
             estoque_atual = current_inventory.get(p_nome, 0)
+            
             with st.expander(f"{p_nome} (Estoque: {estoque_atual})"):
-                
-                # Form de Edição
                 with st.form(key=f"edit_{index}"):
                     c1, c2 = st.columns(2)
                     edit_nome = c1.text_input("Nome", p_nome)
@@ -420,40 +409,31 @@ with tab_config:
                     st.markdown("**Ajuste de Estoque**")
                     c_stock_1, c_stock_2 = st.columns([1, 2])
                     new_stock_val = c_stock_2.number_input("Estoque Real", value=int(estoque_atual), step=1, key=f"stock_{index}")
-                    c_stock_1.info(f"Atual: {estoque_atual}")
-                    
-                    st.divider()
                     
                     cols_btn = st.columns([1, 1])
-                    update_btn = cols_btn[0].form_submit_button("💾 Salvar Alterações")
-                    
-                    # Para deletar, precisamos de um botão fora do form ou lógica com checkbox dentro do form (submit único)
-                    # Streamlit forms não suportam multiplos botões de submit com lógicas diferentes facilmente
-                    delete_check = cols_btn[1].checkbox("🗑️ Excluir Produto")
+                    update_btn = cols_btn[0].form_submit_button("💾 Salvar")
+                    delete_check = cols_btn[1].checkbox("🗑️ Excluir")
 
                     if update_btn:
                         if delete_check:
-                            # Lógica de Exclusão Robusta
-                            # O drop pelo index pode falhar se o DF mudou. Vamos filtrar
                             df_updated = df_catalog[df_catalog['produto'] != p_nome]
-                            save_catalog(df_updated)
-                            st.success(f"Produto {p_nome} excluído!")
+                            save_catalog_state(df_updated)
+                            st.success(f"Excluído: {p_nome}")
                             st.rerun()
                         else:
-                            # Lógica de Atualização
-                            # 1. Atualizar Catálogo
+                            # 1. Update Catalog State
                             df_catalog.at[index, 'produto'] = edit_nome
                             df_catalog.at[index, 'custo'] = edit_custo
                             df_catalog.at[index, 'venda'] = edit_venda
-                            save_catalog(df_catalog)
+                            save_catalog_state(df_catalog) # Salva estado atualizado
                             
-                            # 2. Ajuste de Estoque (Se mudou)
+                            # 2. Update Stock
                             if new_stock_val != estoque_atual:
                                 delta = new_stock_val - estoque_atual
                                 save_adjustment(edit_nome, delta, edit_custo)
-                                st.toast(f"Estoque ajustado: {delta:+d}", icon="📦")
+                                st.toast(f"Estoque ajustado!", icon="📦")
                             
-                            st.success("Produto atualizado!")
+                            st.success("Atualizado!")
                             st.rerun()
 
-st.success("Sistema Carregado (Modo de Demonstração)")
+st.success("Sistema Carregado")
