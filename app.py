@@ -70,11 +70,14 @@ def load_catalog():
                 {"produto": "Picolé Morango", "custo": 1.20, "venda": 4.50},
              ])
         return df
-    except:
-        return pd.DataFrame([
+    except Exception as e:
+        # Retorna DF vazio com flag indicando erro para a UI tratar
+        err_df = pd.DataFrame([
             {"produto": "Paleta Morango", "custo": 3.40, "venda": 12.00},
             {"produto": "Picolé Morango", "custo": 1.20, "venda": 4.50},
         ])
+        err_df.attrs['error'] = str(e)
+        return err_df
 
 def save_catalog(df):
     conn = st.connection("gsheets", type=GSheetsConnection)
@@ -350,6 +353,22 @@ with tab_gestao:
 with tab_config:
     st.markdown("##### ⚙️ Gerenciar Produtos")
     
+    # Check de Erro no Catálogo
+    if hasattr(df_catalog, 'attrs') and 'error' in df_catalog.attrs:
+        st.error("A aba 'Produtos' não foi encontrada na sua planilha!")
+        st.info("O sistema pode tentar criar essa aba automaticamente para você.")
+        
+        if st.button("🛠️ CRIAR ABA 'Produtos' AGORA"):
+            initial_data = pd.DataFrame([
+                {"produto": "Paleta Morango", "custo": 3.40, "venda": 12.00},
+                {"produto": "Picolé Morango", "custo": 1.20, "venda": 4.50}
+            ])
+            if save_catalog(initial_data):
+                st.success("Aba 'Produtos' criada com sucesso! Recarregando...")
+                st.rerun()
+            else:
+                st.error("Falha ao criar automaticamente. Por favor, crie manualmente no Google Sheets.")
+    
     # Form para Adicionar
     with st.expander("Novo Produto", expanded=True):
         new_prod_name = st.text_input("Nome do Produto")
@@ -364,9 +383,10 @@ with tab_config:
                     df_updated = new_item
                 else:
                     df_updated = pd.concat([df_catalog, new_item], ignore_index=True)
-                save_catalog(df_updated)
-                st.success("Produto adicionado!")
-                st.rerun()
+                
+                if save_catalog(df_updated):
+                    st.success("Produto adicionado!")
+                    st.rerun()
             elif new_prod_name in products_list:
                 st.error("Produto já existe!")
     
