@@ -82,8 +82,9 @@ def refresh_data():
 
 # Função para inicializar dados na primeira carga
 def ensure_data_loaded():
-    if st.session_state.df_catalog.empty and st.session_state.df_transacoes.empty:
+    if not st.session_state.data_loaded:
         refresh_data()
+        st.session_state.data_loaded = True # Marca como carregado para não tentar de novo no próximo rerun
         
         # Se após refresh o catálogo estiver vazio, criar estrutura básica na memória para não quebrar UI
         if st.session_state.df_catalog.empty:
@@ -365,24 +366,27 @@ with tab_config:
 
     # Form para Adicionar
     with st.expander("Novo Produto", expanded=True):
-        new_prod_name = st.text_input("Nome do Produto")
-        c1, c2 = st.columns(2)
-        new_custo = c1.number_input("Preço de Custo", min_value=0.0, step=0.1, format="%.2f")
-        new_venda = c2.number_input("Preço de Venda", min_value=0.0, step=0.1, format="%.2f")
-        
-        if st.button("✚ Adicionar Produto"):
-            if new_prod_name and new_prod_name not in products_list:
-                new_item = pd.DataFrame([{"produto": new_prod_name, "custo": new_custo, "venda": new_venda}])
-                if df_catalog.empty:
-                    df_updated = new_item
-                else:
-                    df_updated = pd.concat([df_catalog, new_item], ignore_index=True)
-                
-                if save_catalog_state(df_updated):
-                    st.success("Produto adicionado!")
-                    st.rerun()
-            elif new_prod_name in products_list:
-                st.error("Produto já existe!")
+        with st.form("new_product_form"): # FORMULÁRIO PARA EVITAR RERUNS
+            new_prod_name = st.text_input("Nome do Produto")
+            c1, c2 = st.columns(2)
+            new_custo = c1.number_input("Preço de Custo", min_value=0.0, step=0.1, format="%.2f")
+            new_venda = c2.number_input("Preço de Venda", min_value=0.0, step=0.1, format="%.2f")
+            
+            submitted = st.form_submit_button("✚ Adicionar Produto")
+            
+            if submitted:
+                if new_prod_name and new_prod_name not in products_list:
+                    new_item = pd.DataFrame([{"produto": new_prod_name, "custo": new_custo, "venda": new_venda}])
+                    if df_catalog.empty:
+                        df_updated = new_item
+                    else:
+                        df_updated = pd.concat([df_catalog, new_item], ignore_index=True)
+                    
+                    if save_catalog_state(df_updated):
+                        st.success("Produto adicionado!")
+                        st.rerun()
+                elif new_prod_name in products_list:
+                    st.error("Produto já existe!")
     
     st.markdown("---")
     st.markdown("##### Lista de Produtos")
