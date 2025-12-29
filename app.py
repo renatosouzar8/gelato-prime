@@ -58,11 +58,16 @@ st.markdown("""
 
 # --- DADOS E CONEXÃO ---
 
+# CONSTANTES
+TTL_DURATION = 3600 # 1 Hora de cache para evitar "congelamentos" após inatividade
+
 # GERENCIAMENTO DE ESTADO (SESSION STATE)
 if 'df_transacoes' not in st.session_state:
     st.session_state.df_transacoes = pd.DataFrame()
 if 'df_catalog' not in st.session_state:
     st.session_state.df_catalog = pd.DataFrame()
+if 'data_loaded' not in st.session_state:
+    st.session_state.data_loaded = False
 
 def refresh_data(ttl_val=0):
     conn = st.connection("gsheets", type=GSheetsConnection)
@@ -118,7 +123,12 @@ def save_transaction_state(new_row_dict):
              st.session_state.df_transacoes = pd.concat([st.session_state.df_transacoes, new_df], ignore_index=True)
             
         # 2. Update Remote
-        conn.update(worksheet="Transacoes", data=st.session_state.df_transacoes)
+        # Garantir que salvamos apenas as colunas corretas para não poluir a planilha com colunas auxiliares
+        cols_to_save = ['data', 'produto', 'tipo_movimento', 'quantidade', 'valor_unitario', 'total_monetario']
+        # Interseção para garantir que não dê erro se faltar algo (mas não deve faltar)
+        final_cols = [c for c in cols_to_save if c in st.session_state.df_transacoes.columns]
+        
+        conn.update(worksheet="Transacoes", data=st.session_state.df_transacoes[final_cols])
         st.cache_data.clear()
         return True
     except Exception as e:
@@ -273,9 +283,6 @@ with tab_gestao:
         
         hoje = pd.Timestamp.now().normalize()
         # Garantir que temos coluna de data convertida
-        if 'data_dt' not in df.columns:
-             df['data_dt'] = pd.to_datetime(df['data'], errors='coerce')
-        
         if periodo == "Hoje":
             start_date = hoje
             end_date = hoje + pd.Timedelta(days=1)
@@ -293,7 +300,7 @@ with tab_gestao:
             end_date = pd.to_datetime(d2) + pd.Timedelta(days=1)
             
         # Filtrar DF para KPIs
-        df_filtered = df[(df['data_dt'] >= start_date) & (df['data_dt'] < end_date)]
+        df_filtered = df[(df['data_processed'] >= start_date) & (df['data_processed'] < end_date)]
         
         # 1. Faturamento
         vendas_periodo = df_filtered[df_filtered['tipo_movimento'] == 'Venda']
