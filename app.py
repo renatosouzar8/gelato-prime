@@ -283,6 +283,9 @@ with tab_gestao:
         
         hoje = pd.Timestamp.now().normalize()
         # Garantir que temos coluna de data convertida
+        if 'data_processed' not in df.columns:
+             df['data_processed'] = pd.to_datetime(df['data'], errors='coerce')
+        
         if periodo == "Hoje":
             start_date = hoje
             end_date = hoje + pd.Timedelta(days=1)
