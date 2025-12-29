@@ -64,12 +64,13 @@ if 'df_transacoes' not in st.session_state:
 if 'df_catalog' not in st.session_state:
     st.session_state.df_catalog = pd.DataFrame()
 
-def refresh_data():
+def refresh_data(ttl_val=0):
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
-        # Puxamos com ttl=0 para garantir dados frescos quando o usuário pede
-        st.session_state.df_catalog = conn.read(worksheet="Produtos", ttl=0)
-        st.session_state.df_transacoes = conn.read(worksheet="Transacoes", ttl=0)
+        # Puxamos com ttl variável (0 para forçar, TTL_DURATION para cache)
+        # Se ttl_val > 0, o Streamlit usa o cache se não tiver expirado
+        st.session_state.df_catalog = conn.read(worksheet="Produtos", ttl=ttl_val)
+        st.session_state.df_transacoes = conn.read(worksheet="Transacoes", ttl=ttl_val)
         
         # Converter datas
         if not st.session_state.df_transacoes.empty and 'data' in st.session_state.df_transacoes.columns:
@@ -83,7 +84,9 @@ def refresh_data():
 # Função para inicializar dados na primeira carga
 def ensure_data_loaded():
     if not st.session_state.data_loaded:
-        refresh_data()
+        # Na primeira carga (frio ou wake up), tentamos usar cache se possível para responder rápido
+        # e evitar timeout de conexão inicial.
+        refresh_data(ttl_val=TTL_DURATION)
         st.session_state.data_loaded = True # Marca como carregado para não tentar de novo no próximo rerun
         
         # Se após refresh o catálogo estiver vazio, criar estrutura básica na memória para não quebrar UI
@@ -180,7 +183,7 @@ products_list = df_catalog['produto'].tolist() if not df_catalog.empty else []
 
 # Botão de Refresh Manual
 if st.button("🔄 Atualizar Dados da Nuvem", help="Força baixar dados novos do Google Sheets"):
-    refresh_data()
+    refresh_data(ttl_val=0) # Força reload
     st.rerun()
 
 # Tabs de Navegação
@@ -191,69 +194,71 @@ with tab_registrar:
     st.markdown("##### Movimentação Rápida")
     
     with st.container():
-        # Input 1: Produto
-        if not products_list:
-            st.warning("Cadastre produtos na aba Configuração!")
-            produto = None
-        else:
-            produto = st.selectbox("Produto", products_list, label_visibility="collapsed", placeholder="Selecione o produto")
-        
-        col_form_1, col_form_2 = st.columns([1, 1])
-        
-        with col_form_1:
-            # Input 2: Quantidade
-            qtd = st.number_input("Qtd", min_value=1, value=1, step=1)
-            
-        with col_form_2:
-            # Input 3: Tipo
-            tipo_map = {
-                "🔴 Venda": "Venda",
-                "🏠 Família": "Consumo Família",
-                "🟢 Compra": "Compra Estoque",
-                "☠️ Quebra": "Quebra/Perda"
-            }
-            tipo_display = st.radio("Tipo", list(tipo_map.keys()), horizontal=True, label_visibility="visible") 
-            tipo_movimento = tipo_map[tipo_display]
-        
-        # Botão Confirmar
-        if st.button("✅ CONFIRMAR MOVIMENTO", use_container_width=True):
-            if not produto:
-                st.error("Selecione um produto!")
+        with st.form("transaction_form"):
+            # Input 1: Produto
+            if not products_list:
+                st.warning("Cadastre produtos na aba Configuração!")
+                produto = None
             else:
-                # Buscar preços no DF do catálogo (Usando session state)
-                try:
-                    item_data = df_catalog[df_catalog['produto'] == produto].iloc[0]
-                    custo_item = float(item_data['custo'])
-                    venda_item = float(item_data['venda'])
-                except:
-                    custo_item = 0.0
-                    venda_item = 0.0
+                produto = st.selectbox("Produto", products_list, label_visibility="collapsed", placeholder="Selecione o produto")
+            
+            col_form_1, col_form_2 = st.columns([1, 1])
+            
+            with col_form_1:
+                # Input 2: Quantidade
+                qtd = st.number_input("Qtd", min_value=1, value=1, step=1)
                 
-                if tipo_movimento == "Venda":
-                    valor_unitario = venda_item
-                    total_monetario = valor_unitario * qtd
-                elif tipo_movimento in ["Consumo Família", "Compra Estoque", "Quebra/Perda"]:
-                    valor_unitario = custo_item
-                    if tipo_movimento == "Compra Estoque":
-                        total_monetario = valor_unitario * qtd * -1
-                    elif tipo_movimento == "Consumo Família":
-                        total_monetario = valor_unitario * qtd
-                    else:
-                        total_monetario = 0 
-
-                # Preparar linha
-                new_row = {
-                    "data": datetime.now().isoformat(),
-                    "produto": produto,
-                    "tipo_movimento": tipo_movimento,
-                    "quantidade": qtd,
-                    "valor_unitario": valor_unitario,
-                    "total_monetario": total_monetario
+            with col_form_2:
+                # Input 3: Tipo
+                tipo_map = {
+                    "🔴 Venda": "Venda",
+                    "🏠 Família": "Consumo Família",
+                    "🟢 Compra": "Compra Estoque",
+                    "☠️ Quebra": "Quebra/Perda"
                 }
-                
-                if save_transaction_state(new_row):
-                    st.toast(f"✅ {produto} ({qtd}x) registrado!", icon="🍦")
-                # Não faz rerun para manter fluidez
+                tipo_display = st.radio("Tipo", list(tipo_map.keys()), horizontal=True, label_visibility="visible") 
+                tipo_movimento = tipo_map[tipo_display]
+            
+            # Botão Confirmar
+            submitted = st.form_submit_button("✅ CONFIRMAR MOVIMENTO", use_container_width=True)
+            
+            if submitted:
+                if not produto:
+                    st.error("Selecione um produto!")
+                else:
+                    # Buscar preços no DF do catálogo (Usando session state)
+                    try:
+                        item_data = df_catalog[df_catalog['produto'] == produto].iloc[0]
+                        custo_item = float(item_data['custo'])
+                        venda_item = float(item_data['venda'])
+                    except:
+                        custo_item = 0.0
+                        venda_item = 0.0
+                    
+                    if tipo_movimento == "Venda":
+                        valor_unitario = venda_item
+                        total_monetario = valor_unitario * qtd
+                    elif tipo_movimento in ["Consumo Família", "Compra Estoque", "Quebra/Perda"]:
+                        valor_unitario = custo_item
+                        if tipo_movimento == "Compra Estoque":
+                            total_monetario = valor_unitario * qtd * -1
+                        elif tipo_movimento == "Consumo Família":
+                            total_monetario = valor_unitario * qtd
+                        else:
+                            total_monetario = 0 
+
+                    # Preparar linha
+                    new_row = {
+                        "data": datetime.now().isoformat(),
+                        "produto": produto,
+                        "tipo_movimento": tipo_movimento,
+                        "quantidade": qtd,
+                        "valor_unitario": valor_unitario,
+                        "total_monetario": total_monetario
+                    }
+                    
+                    if save_transaction_state(new_row):
+                        st.toast(f"✅ {produto} ({qtd}x) registrado!", icon="🍦")
 
 # --- ABA 2: GESTÃO ---
 with tab_gestao:
