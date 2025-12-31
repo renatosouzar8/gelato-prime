@@ -185,7 +185,8 @@ def process_receipt_image(image_file, product_names):
     genai.configure(api_key=api_key)
     
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # Usando modelo disponível na chave do usuário (2.5 Flash)
+        model = genai.GenerativeModel('gemini-2.5-flash')
         
         # Carregar imagem para API
         # Streamlit file uploader returns a BytesIO-like object
