@@ -2,6 +2,8 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 from datetime import datetime
+import google.generativeai as genai
+import json
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
@@ -172,6 +174,56 @@ def save_adjustment(produto, delta_qtd, custo_unitario):
     }
     return save_transaction_state(new_row)
 
+# Função de Processamento de Imagem com Gemini
+def process_receipt_image(image_file, product_names):
+    # 1. Verificar API Key
+    if 'gemini' not in st.secrets or 'api_key' not in st.secrets['gemini']:
+        st.error("⚠️ API Key do Google Gemini não configurada em secrets.toml")
+        return None
+
+    api_key = st.secrets['gemini']['api_key']
+    genai.configure(api_key=api_key)
+    
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Carregar imagem para API
+        # Streamlit file uploader returns a BytesIO-like object
+        image_bytes = image_file.getvalue()
+        
+        prompt = f"""
+        Analyze this receipt/order image. Identify the products and their quantities.
+        
+        CRITICAL: Map each identified item to the CLOSEST MATCH in this list of valid products:
+        {json.dumps(product_names)}
+        
+        Rules:
+        1. Ignore items that are clearly not in the list (like delivery fees, unrelated text).
+        2. If an item matches a valid product (even with slight name variation), use the EXACT VALID NAME from the list.
+        3. If quantity is not specified, assume 1.
+        
+        Return ONLY a raw JSON list of objects. Do not use Markdown formatting.
+        Format:
+        [
+            {{"produto": "Exact Valid Name", "quantidade": 2}},
+            {{"produto": "Another Valid Name", "quantidade": 1}}
+        ]
+        """
+        
+        response = model.generate_content([
+            {'mime_type': image_file.type, 'data': image_bytes},
+            prompt
+        ])
+        
+        # Limpeza básica do JSON (caso venha com markdown ```json ... ```)
+        text_resp = response.text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(text_resp)
+        return data
+        
+    except Exception as e:
+        st.error(f"Erro ao processar imagem: {e}")
+        return None
+
 # --- UI APP ---
 
 # Header com Logo
@@ -199,9 +251,73 @@ if st.button("🔄 Atualizar Dados da Nuvem", help="Força baixar dados novos do
 # Tabs de Navegação
 tab_registrar, tab_gestao, tab_config = st.tabs(["📝 Registrar", "📊 Gestão", "⚙️ Config"])
 
+
 # --- ABA 1: REGISTRAR ---
 with tab_registrar:
     st.markdown("##### Movimentação Rápida")
+
+    # --- SESSÃO NOVA: IMPORTAÇÃO VIA IA ---
+    with st.expander("📸 Importar Pedido (Foto/Print)", expanded=False):
+        st.caption("Tire uma foto do pedido ou anexe um print do iFood.")
+        uploaded_file = st.file_uploader("Upload Imagem", type=['png', 'jpg', 'jpeg'], label_visibility="collapsed")
+        
+        if uploaded_file and products_list:
+            if st.button("🤖 Ler Pedido com IA"):
+                with st.spinner("Analisando imagem..."):
+                    ai_result = process_receipt_image(uploaded_file, products_list)
+                    
+                    if ai_result:
+                        st.session_state.ai_import_data = ai_result # Salva no state para não perder no rerun
+                        st.success("Leitura concluída! Verifique abaixo.")
+        
+        # Exibir área de confirmação se houver dados importados
+        if 'ai_import_data' in st.session_state and st.session_state.ai_import_data:
+            st.divider()
+            st.markdown("###### Conferência")
+            
+            # Editor de Dados (Permite ao usuário corrigir antes de salvar)
+            edited_df = st.data_editor(
+                pd.DataFrame(st.session_state.ai_import_data),
+                num_rows="dynamic",
+                column_config={
+                    "produto": st.column_config.SelectboxColumn("Produto", options=products_list, required=True),
+                    "quantidade": st.column_config.NumberColumn("Qtd", min_value=1, step=1, required=True)
+                },
+                use_container_width=True,
+                key="editor_ai"
+            )
+            
+            if st.button("✅ Confirmar Importação em Massa", type="primary"):
+                count_success = 0
+                for idx, row in edited_df.iterrows():
+                    # Lógica de salvar similar ao unitário
+                    p_name = row['produto']
+                    qtd = row['quantidade']
+                    
+                    # Busca valores
+                    try:
+                        item_data = df_catalog[df_catalog['produto'] == p_name].iloc[0]
+                        valor_venda = float(item_data['venda'])
+                    except:
+                        valor_venda = 0.0
+                    
+                    new_row = {
+                        "data": datetime.now().isoformat(),
+                        "produto": p_name,
+                        "tipo_movimento": "Venda", # Assumimos Venda para imports de pedido
+                        "quantidade": qtd,
+                        "valor_unitario": valor_venda,
+                        "total_monetario": valor_venda * qtd
+                    }
+                    if save_transaction_state(new_row):
+                        count_success += 1
+                
+                if count_success > 0:
+                    st.success(f"{count_success} itens registrados com sucesso!")
+                    del st.session_state.ai_import_data # Limpa area de importação
+                    st.rerun()
+
+    st.divider()
     
     with st.container():
         with st.form("transaction_form"):
