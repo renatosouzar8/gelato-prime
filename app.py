@@ -185,7 +185,7 @@ def process_receipt_image(image_file, product_names):
     genai.configure(api_key=api_key)
     
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
         # Carregar imagem para API
         # Streamlit file uploader returns a BytesIO-like object
@@ -221,7 +221,15 @@ def process_receipt_image(image_file, product_names):
         return data
         
     except Exception as e:
-        st.error(f"Erro ao processar imagem: {e}")
+        error_msg = f"Erro ao processar imagem: {e}"
+        # Tentar listar modelos disponíveis para ajudar no debug
+        try:
+            available_models = [m.name for m in genai.list_models()]
+            error_msg += f"\n\nModelos Disponíveis na sua chave: {available_models}"
+        except:
+            pass
+            
+        st.error(error_msg)
         return None
 
 # --- UI APP ---
